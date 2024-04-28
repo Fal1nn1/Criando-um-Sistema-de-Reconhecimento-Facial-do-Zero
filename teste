@@ -1,0 +1,214 @@
+# Importar as bibliotecas necessárias
+from IPython.display import display, Javascript, Image
+from google.colab.output import eval_js
+from base64 import b64decode, b64encode
+import cv2
+import numpy as np
+import PIL
+import io
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+# Inicializar o modelo de detecção de faces Haar Cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Função para converter o objeto JavaScript em uma imagem OpenCV
+def js_to_image(js_reply):
+    """
+    Params:
+            js_reply: Objeto JavaScript contendo a imagem da webcam
+    Returns:
+            img: Imagem OpenCV BGR
+    """
+    # Decodificar a imagem base64
+    image_bytes = b64decode(js_reply.split(',')[1])
+    # Converter bytes para matriz numpy
+    jpg_as_np = np.frombuffer(image_bytes, dtype=np.uint8)
+    # Decodificar a matriz numpy em uma imagem OpenCV BGR
+    img = cv2.imdecode(jpg_as_np, flags=1)
+
+    return img
+
+# Função para converter a imagem de caixa delimitadora OpenCV em uma string de bytes base64 para ser sobreposta no fluxo de vídeo
+def bbox_to_bytes(bbox_array):
+    """
+    Params:
+            bbox_array: Matriz numpy (pixels) contendo a caixa delimitadora para sobrepor no fluxo de vídeo.
+    Returns:
+            bytes: String de bytes da imagem base64
+    """
+    # Converter matriz em imagem PIL
+    bbox_PIL = PIL.Image.fromarray(bbox_array, 'RGBA')
+    iobuf = io.BytesIO()
+    # Formatar a caixa delimitadora em png para retorno
+    bbox_PIL.save(iobuf, format='png')
+    # Formatar a string de retorno
+    bbox_bytes = 'data:image/png;base64,{}'.format((str(b64encode(iobuf.getvalue()), 'utf-8')))
+
+    return bbox_bytes
+
+# Função para tirar uma foto com a webcam e detectar faces nela
+def take_photo(filename='photo.jpg', quality=0.8):
+    # JavaScript para capturar a imagem da webcam
+    js = Javascript('''
+        async function takePhoto(quality) {
+          const div = document.createElement('div');
+          const capture = document.createElement('button');
+          capture.textContent = 'Capture';
+          div.appendChild(capture);
+
+          const video = document.createElement('video');
+          video.style.display = 'block';
+          const stream = await navigator.mediaDevices.getUserMedia({video: true});
+
+          document.body.appendChild(div);
+          div.appendChild(video);
+          video.srcObject = stream;
+          await video.play();
+
+          // Resize the output to fit the video element.
+          google.colab.output.setIframeHeight(document.documentElement.scrollHeight, true);
+
+          // Wait for Capture to be clicked.
+          await new Promise((resolve) => capture.onclick = resolve);
+
+          const canvas = document.createElement('canvas');
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          canvas.getContext('2d').drawImage(video, 0, 0);
+          stream.getVideoTracks()[0].stop();
+          div.remove();
+          return canvas.toDataURL('image/jpeg', quality);
+        }
+        ''')
+    display(js)
+
+    # Obter dados da foto
+    data = eval_js('takePhoto({})'.format(quality))
+    # Obter imagem no formato OpenCV
+    img = js_to_image(data)
+    # Converter imagem para escala de cinza
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    # Detectar caixas delimitadoras de faces usando Haar Cascade
+    faces = face_cascade.detectMultiScale(gray)
+    # Desenhar caixas delimitadoras de faces na imagem
+    for (x, y, w, h) in faces:
+        img = cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
+    # Salvar imagem
+    cv2.imwrite(filename, img)
+
+    return filename
+
+# Função para carregar modelo YOLOv4
+def load_yolo_model():
+    # Carregar o modelo YOLOv4
+    net = cv2.dnn.readNet("yolov4.weights", "yolov4.cfg")
+    # Carregar as classes reconhecidas pelo modelo
+    with open("coco.names", "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+    return net, classes
+
+# Função para detecção e classificação de objetos usando YOLOv4
+def detect_objects_yolo(img, net, classes):
+    # Obter largura e altura da imagem
+    height, width, _ = img.shape
+    # Preprocessar a imagem para ser usada como entrada para o modelo YOLOv4
+    blob = cv2.dnn.blobFromImage(img, 1/255.0, (416, 416), swapRB=True, crop=False)
+    # Definir nomes das camadas de saída do modelo YOLOv4
+    layer_names = net.getLayerNames()
+    output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+    # Definir cor da caixa delimitadora e fonte de texto
+    colors = np.random.uniform(0, 255, size=(len(classes), 3))
+    # Passar a imagem pré-processada pelo modelo YOLOv4
+    net.setInput(blob)
+    outs = net.forward(output_layers)
+    # Inicializar listas para armazenar caixas delimitadoras e confiança dos objetos detectados
+    boxes = []
+    confidences = []
+    class_ids = []
+    # Processar saídas do modelo YOLOv4
+    for out in outs:
+        for detection in out:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            # Filtrar detecções fracas
+            if confidence > 0.5:
+                # Obter coordenadas da caixa delimitadora do objeto detectado
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+                # Calcular coordenadas da caixa delimitadora
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                # Armazenar coordenadas, confiança e classe do objeto detectado
+                boxes.append([x, y, w, h])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+    # Aplicar supressão não máxima para remover caixas delimitadoras sobrepostas
+    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+    # Inicializar lista para armazenar caixas delimitadoras finais
+    detected_boxes = []
+    # Desenhar caixas delimitadoras e etiquetas dos objetos detectados na imagem
+    if len(indexes) > 0:
+        for i in indexes.flatten():
+            x, y, w, h = boxes[i]
+            label = str(classes[class_ids[i]])
+            confidence = confidences[i]
+            color = colors[class_ids[i]]
+            cv2.rectangle(img, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(img, f"{label} {confidence:.2f}", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # Armazenar caixa delimitadora e etiqueta do objeto detectado
+            detected_boxes.append([x, y, w, h, label, confidence])
+    return img, detected_boxes
+
+# Carregar modelo YOLOv4
+net, classes = load_yolo_model()
+
+# Função para tirar uma foto com a webcam, detectar e classificar objetos nela
+def take_photo_with_detection(filename='photo_detection.jpg', quality=0.8):
+    # JavaScript para capturar a imagem da webcam
+    js = Javascript('''
+        async function takePhoto(quality) {
+          const div = document.createElement('div');
+          const capture = document.createElement('button');
+          capture.textContent = 'Capture';
+          div.appendChild(capture);
+
+          const video = document.createElement('video');
+          video.style.display = 'block';
+          const stream = await navigator.mediaDevices.getUserMedia({video: true});
+
+          document.body.appendChild(div);
+          div.appendChild(video);
+          video.srcObject = stream;
+          await video.play();
+
+          // Resize the output to fit the video element.
+          google.colab.output.setIframeHeight(document.documentElement.scrollHeight, true);
+
+          // Wait for Capture to be clicked.
+          await new Promise((resolve) => capture.onclick = resolve);
+
+          const canvas = document.createElement('canvas');
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          canvas.getContext('2d').drawImage(video, 0, 0);
+          stream.getVideoTracks()[0].stop();
+          div.remove();
+          return canvas.toDataURL('image/jpeg', quality);
+        }
+        ''')
+    display(js)
+
+    # Obter dados da foto
+    data = eval_js('takePhoto({})'.format(quality))
+    # Obter imagem no formato OpenCV
+    img = js_to_image(data)
+    # Detectar e classificar objetos na imagem usando YOLOv4
+    img_with_boxes, detected_boxes = detect_objects_yolo(img, net, classes)
+    # Salvar imagem com caixas delimitadoras e etiquetas
+    cv2.imwrite(filename, img_with_boxes)
+
+    return filename, detected_boxes
